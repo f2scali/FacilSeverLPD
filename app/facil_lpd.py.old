@@ -1,0 +1,104 @@
+# file: lpd_service.py
+import os
+import socket
+from concurrent.futures import ThreadPoolExecutor
+import win32serviceutil
+import win32service
+import win32event
+import servicemanager
+
+
+class LPDServer:
+    def __init__(self, host: str = "0.0.0.0", port: int = 515, spool_dir: str = "./spool", max_threads: int = 10):
+        self.host = host
+        self.port = port
+        self.spool_dir = spool_dir
+        self.max_threads = max_threads
+        os.makedirs(spool_dir, exist_ok=True)
+        self.server_socket = None
+        self.running = False
+
+    def handle_connection(self, conn, addr):
+        print(f"Connection from {addr}")
+        try:
+            while True:
+                command = conn.recv(1)
+                if not command:
+                    break
+
+                if command == b'\x02':  # Receive a print job
+                    self.receive_print_job(conn)
+                else:
+                    print(f"Unknown command: {command}")
+                    conn.sendall(b'\x01')  # Send an error code
+        except Exception as e:
+            print(f"Error handling connection: {e}")
+        finally:
+            conn.close()
+
+    def receive_print_job(self, conn):
+        queue_name = conn.recv(1024).decode('utf-8').strip()
+        conn.sendall(b'\x00')  # Acknowledge the command
+
+        # Receive control file
+        control_file_size = self._read_size_prefixed_data(conn, "control file")
+        control_file_data = conn.recv(control_file_size).decode('utf-8')
+        control_file_path = os.path.join(self.spool_dir, f"cf_{queue_name}.txt")
+        with open(control_file_path, "w") as f:
+            f.write(control_file_data)
+        conn.sendall(b'\x00')  # Acknowledge
+
+        # Receive data file
+        data_file_size = self._read_size_prefixed_data(conn, "data file")
+        data_file_data = conn.recv(data_file_size)
+        data_file_path = os.path.join(self.spool_dir, f"df_{queue_name}.txt")
+        with open(data_file_path, "wb") as f:
+            f.write(data_file_data)
+        conn.sendall(b'\x00')  # Acknowledge
+
+    def _read_size_prefixed_data(self, conn, file_type):
+        size_data = conn.recv(1024).decode('utf-8').strip()
+        return int(size_data.split()[0])
+
+    def start(self):
+        print("Starting LPD server...")
+        self.running = True
+        with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(5)
+            while self.running:
+                conn, addr = self.server_socket.accept()
+                executor.submit(self.handle_connection, conn, addr)
+
+    def stop(self):
+        print("Stopping LPD server...")
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+
+
+class LPDService(win32serviceutil.ServiceFramework):
+    _svc_name_ = "FacilLPDService"
+    _svc_display_name_ = "FACIL LPD Server Service"
+    _svc_description_ = "A Line Printer Daemon (LPD) server implemented in Python for SimpleSoft.com"
+
+    def __init__(self, args):
+        super().__init__(args)
+        self.stop_event = win32event.CreateEvent(None, 0, 0, None)
+        self.server = LPDServer()
+
+    def SvcStop(self):
+        self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+        self.server.stop()
+        win32event.SetEvent(self.stop_event)
+
+    def SvcDoRun(self):
+        servicemanager.LogInfoMsg("Starting LPD Server Service...")
+        self.server.start()
+
+
+if __name__ == "__main__":
+    win32serviceutil.HandleCommandLine(LPDService)
+
